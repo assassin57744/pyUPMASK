@@ -6,10 +6,20 @@ from astropy.table import Column
 from astropy.table import Table, vstack
 import configparser
 import warnings
-from distutils.util import strtobool
+# from distutils.util import strtobool
 from sklearn.preprocessing import MinMaxScaler
 from .outlierRjct import stdRegion, sklearnMethod
 
+#  修改后的现代化兼容写法
+def strtobool(val):
+    """将字符串强转为布尔值，完美替代已移除的 distutils.util.strtobool"""
+    val = str(val).lower()
+    if val in ('y', 'yes', 't', 'true', 'on', '1'):
+        return True
+    elif val in ('n', 'no', 'f', 'false', 'off', '0'):
+        return False
+    else:
+        raise ValueError(f"invalid truth value {val!r}")
 
 def readINI():
     """

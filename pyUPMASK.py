@@ -4,8 +4,8 @@ from pathlib import Path
 import numpy as np
 from astropy.stats import RipleysKEstimator
 import time as t
-from modules import outer
-from modules.dataIO import readFiles, readINI, dread, dmask, dxynorm, dwrite
+from upmask_core import outer
+from upmask_core.dataIO import readFiles, readINI, dread, dmask, dxynorm, dwrite
 import multiprocessing as mp
 
 
@@ -175,6 +175,96 @@ def OLfunc(args, KDE_vals):
     """
     probs, _ = outer.loop(*args, KDE_vals)
     return probs
+
+
+# =====================================================================
+# 🛸 针对 hunt24-audit 工厂管线定制的现代化内存解耦 API 入口
+# =====================================================================
+def upmask_api(input_df, custom_config, rnd_seed=None):
+    """
+    在内存中直接运行 UPMASK 的闭环函数。
+    
+    :param input_df: pandas.DataFrame, 必须包含恒星ID、位置(x, y)及用于聚类的特征列和误差列
+    :param custom_config: dict, 替换 params.ini 的参数字典
+    :param rnd_seed: int/str, 随机种子。如果为 None, 则使用全局默认设置
+    :return: numpy.ndarray, 返回与 input_df 行数完全对应的最终成员概率数组
+    """
+    import numpy as np
+    
+    # 1. 提取字典参数并设置默认值（防止字典里漏写某些不常用的参数）
+    parallel_flag   = custom_config.get('parallel_flag', False)
+    parallel_procs  = custom_config.get('parallel_procs', 'None')
+    verbose         = custom_config.get('verbose', 1)
+    ID_c            = custom_config.get('ID_c')            # ID 列名
+    x_c             = custom_config.get('x_c')             # x 坐标列名
+    y_c             = custom_config.get('y_c')             # y 坐标列名
+    data_cols       = custom_config.get('data_cols')       # 聚类特征列名列表 (如 pmra, pmdec)
+    data_errs       = custom_config.get('data_errs')       # 聚类误差列名列表
+    oultr_method    = custom_config.get('oultr_method', 'stdregion')
+    stdRegion_nstd  = custom_config.get('stdRegion_nstd', 3.0)
+    OL_runs         = custom_config.get('OL_runs', 5)
+    resampleFlag    = custom_config.get('resampleFlag', True)
+    PCAflag         = custom_config.get('PCAflag', False)
+    PCAdims         = custom_config.get('PCAdims', 'None')
+    GUMM_flag       = custom_config.get('GUMM_flag', False)
+    GUMM_perc       = custom_config.get('GUMM_perc', 10)
+    KDEP_flag       = custom_config.get('KDEP_flag', False)
+    IL_runs         = custom_config.get('IL_runs', 100)
+    N_membs         = custom_config.get('N_membs', 10)
+    N_cl_max        = custom_config.get('N_cl_max', 20)
+    clust_method    = custom_config.get('clust_method', 'kmeans')
+    clRjctMethod    = custom_config.get('clRjctMethod', 'uniform')
+    C_thresh        = custom_config.get('C_thresh', 0.5)
+    cl_method_pars  = custom_config.get('cl_method_pars', {})
+
+    # 2. 随机种子初始化
+    if rnd_seed is None or rnd_seed == 'None':
+        seed = np.random.randint(100000)
+    else:
+        seed = int(rnd_seed)
+    np.random.seed(seed)
+
+    # 3. 仿照 dread() 逻辑，直接从内存中的 DataFrame 提取 numpy 数组
+    # 提取完整 ID, xy坐标, 数据和误差
+    cl_ID = input_df[ID_c].to_numpy()
+    cl_xy = input_df[[x_c, y_c]].to_numpy()
+    cl_data = input_df[data_cols].to_numpy()
+    cl_errs = input_df[data_errs].to_numpy()
+
+    # 4. 绕过原文件 I/O，复用原作者的核心清洗、转换与计算流程
+    from upmask_core.dataIO import dmask, dxynorm
+    
+    # 剔除离群值 (注意: 原作者 dmask 会返回被过滤掉的 mask 数据，我们这里主要拿有效数组)
+    msk_data, ID, xy, data, data_err = dmask(
+        cl_ID, cl_xy, cl_data, cl_errs, oultr_method, stdRegion_nstd)
+
+    # 将坐标 (x, y) 归一化到 [0, 1] 空间（Ripley's K 估算器需要）
+    xy01 = dxynorm(xy)
+
+    # 5. 调用原作者的进程处理核心
+    probs_all = dataProcess(
+        ID, xy01, data, data_err, verbose, OL_runs,
+        parallel_flag, parallel_procs, resampleFlag, PCAflag, PCAdims,
+        GUMM_flag, GUMM_perc, KDEP_flag, IL_runs, N_membs, N_cl_max,
+        clust_method, clRjctMethod, C_thresh, cl_method_pars)
+
+    # 6. 计算最终概率均值
+    if OL_runs > 1:
+        probs_mean = np.mean(probs_all, 0)
+    else:
+        probs_mean = probs_all[0]
+
+    # 7. 将计算出来的有效恒星概率，精准映射回原始 input_df 的物理长度中
+    # 因为原作者的 dmask 会过滤掉一部分离群星，我们需要让返回数组的长度和原本传入的行数完全一致
+    final_probabilities = np.zeros(len(input_df))
+    
+    # 利用 ID 进行高效索引匹配映射
+    id_to_prob = dict(zip(ID, probs_mean))
+    for idx, row_id in enumerate(cl_ID):
+        final_probabilities[idx] = id_to_prob.get(row_id, 0.0)  # 被丢弃的离群星概率默认为 0.0
+
+    return final_probabilities
+
 
 
 if __name__ == '__main__':
